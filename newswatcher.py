@@ -1,4 +1,5 @@
 import time
+import re
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from gdeltdoc import GdeltDoc, Filters
@@ -8,7 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 gd = GdeltDoc()
 
 # Track recently seen article URLs
-seen_articles = deque(maxlen=100)  # Rolling cache with a max size of 100 normalized URLs
+seen_articles = deque(maxlen=500)  # Increased cache size for deduplication
 
 # Track the most recent article's publication time
 last_seen_time = datetime.now(timezone.utc) - timedelta(minutes=2)
@@ -21,67 +22,85 @@ tokenizer.pad_token = tokenizer.eos_token
 
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
-    device_map="auto",  # Automatically map to GPU if available
-    low_cpu_mem_usage=True,  # Optimize memory usage
+    device_map="auto",
+    torch_dtype="float16",  # Use half-precision for faster inference
+    low_cpu_mem_usage=True,
 )
 
-# Counter for headlines to trigger test injection
-headline_counter = 0
 
 
 
-def analyze_headline(headline):
+
+
+def analyze_headlines_block(headlines, model, tokenizer):
     """
-    Analyze the headline using Mistral 7B to determine if it mentions a Russian attack on NATO.
+    Analyze a block of headlines using Mistral 7B.
     """
-    # Refined prompt with more explicit examples
+    # Limit to the maximum number of headlines that fit within the model's context window
+    max_headlines = 100
+    headlines = headlines[:max_headlines]
+
+    # Construct the prompt
     prompt = (
-        "Classify the headline below as 'Yes' if it says Russia has attacked or conducted military action in a NATO country, "
-        "or 'No' if it does not. Only respond with 'Yes' or 'No'.\n\n"
-        "Examples:\n"
-        "Headline: Russia launches a missile strike on NATO base in Poland\nAnswer: Yes\n"
-        "Headline: Russian forces cross into Latvia (a NATO country)\nAnswer: Yes\n"
-        "Headline: Russian navy conducts drills in the Arctic Ocean\nAnswer: No\n\n"
-        f"Headline: {headline}\nAnswer:"
+        "Analyze the following news headlines. If any headline suggests Russia attacking a NATO country "
+        "or starting military conflicts involving NATO, respond with 'Yes' followed by the troubling headline(s). "
+        "If none of them suggest such activity, respond with 'No'. Respond only with 'Yes' or 'No'.\n\n"
+        "Headlines:\n" + "\n".join(f"- {headline}" for headline in headlines) + "\n\nResponse:"
     )
 
-    # Tokenize and preprocess the prompt
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
+    # Tokenize the block of text
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=2048,
+    ).to("cuda")
 
-    # Generate a response from the model
+    # Generate a response
     outputs = model.generate(
         input_ids=inputs["input_ids"],
         attention_mask=inputs["attention_mask"],
-        max_new_tokens=5,  # Limit output to 5 tokens
-        do_sample=False,  # Deterministic decoding
-        pad_token_id=tokenizer.pad_token_id,  # Explicitly set pad token
-        eos_token_id=tokenizer.eos_token_id,  # Ensure generation stops at EOS
+        max_new_tokens=20,  # Strictly limit output length
+        do_sample=False,
+        temperature=0,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
     )
 
-    # Decode the generated output
+    # Decode the response
     result = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    print(f"Generated Output: {result}")  # Debugging
 
-    # Extract and validate the answer
-    if "Answer:" in result:
-        answer = result.split("Answer:")[-1].strip().split()[0]  # Get the first word after "Answer:"
-        if answer in ["Yes", "No"]:
-            return answer
+    # Debugging: Display the raw output
+    print(f"Raw Model Output:\n{result}\n")
 
-    return "Unknown"  # Default if no valid answer is found
+    # Validate and parse the response
+    if result.startswith("Yes"):
+        troubling_headlines = re.findall(r"- .*", result)
+        troubling_text = "\n".join(troubling_headlines)
+        return f"Yes. {troubling_text}" if troubling_text else "Yes."
+    elif result.startswith("No"):
+        return "No"
+    else:
+        # Fallback for unexpected responses
+        return f"Unknown. Model response:\n{result}"
 
 
 
 
-# Inject a test headline to verify positive case detection
-test_headline = "Russia wins chess battle after 120 moves"
-print(f"\nInjected Test Headline: {test_headline}")
-test_analysis = analyze_headline(test_headline)
-print(f"Test Analysis: {test_analysis}")
+
+# Inject a short test block at the start
+test_headlines = [
+    "Russian forces cross into Latvia",
+    "Russia launches a missile strike on NATO base in Poland",
+    "Local sports team wins championship",
+]
+print(f"\nInjected Test Block:\n{test_headlines}")
+test_response = analyze_headlines_block(test_headlines, model, tokenizer)
+print(f"Test Block Analysis:\n{test_response}")
 print("=" * 40)
-time.sleep(10)
 
-
+# Main loop remains the same
 while True:
     print(f"\nPolling GDELT API at {datetime.now(timezone.utc).isoformat()}...")
 
@@ -101,7 +120,9 @@ while True:
             print("No articles found.")
         else:
             print(f"Found {len(articles_df)} articles.")
-            # Display each new article and analyze with Mistral 7B
+
+            # Gather new headlines
+            headlines_to_analyze = []
             for index, row in articles_df.iterrows():
                 raw_url = row.get("url")
                 raw_title = row.get("title", "No Title")
@@ -111,36 +132,17 @@ while True:
                 else:
                     normalized_url = None
 
-                # Increment the headline counter
-                headline_counter += 1
-
-                # Inject a test headline every 10 headlines
-                if headline_counter % 10 == 0:
-                    test_headline = "Russia launches a missile strike on NATO base in Poland"
-                    print(f"\nInjected Test Headline: {test_headline}")
-                    test_analysis = analyze_headline(test_headline)
-                    print(f"Test Analysis: {test_analysis}")
-                    print("=" * 40)
-
-                    # Verify and skip the test headline
-                    if test_analysis != "Yes":
-                        print("Warning: Test headline did not return expected 'Yes'")
-                    continue
-
+                # Skip already seen articles
                 if normalized_url and normalized_url not in seen_articles:
-                    # Display the article
-                    print(f"Title: {raw_title}")
-                    print(f"URL: {raw_url}")
-                    print(f"Source: {row.get('sourcecountry', 'Unknown')}")
-                    print("-" * 40)
-
-                    # Analyze the headline with Mistral 7B
-                    analysis = analyze_headline(raw_title)
-                    print(f"Mistral Analysis: {analysis}")
-                    print("=" * 40)
-
-                    # Add the normalized URL to the queue
+                    headlines_to_analyze.append(raw_title)
                     seen_articles.append(normalized_url)
+
+            # Analyze the block of headlines
+            if headlines_to_analyze:
+                print("\nAnalyzing Block of Headlines...")
+                response = analyze_headlines_block(headlines_to_analyze, model, tokenizer)
+                print(f"Model Response:\n{response}")
+                print("=" * 40)
 
     except Exception as e:
         print(f"Error during polling: {e}")
